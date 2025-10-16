@@ -23,8 +23,7 @@ app.listen(PORT, () => {
 
 export const connectDb = async () => {
   try {
-    const uri = "mongodb+srv://sarvesh221160_db_user:0pMXmbHCt6XJmbhj@cluster0.fcrgemb.mongodb.net/byteverse?retryWrites=true&w=majority&appName=Cluster0";
-    
+    const uri = process.env.MONGODB_URL;
     await mongoose.connect(uri, {
       useNewUrlParser: true,
       useUnifiedTopology: true,

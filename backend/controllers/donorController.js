@@ -6,82 +6,9 @@ import Receiver from "../models/receiverModel.js";
 import dotenv from "dotenv";
 dotenv.config();
 
-export const donorRequest = async (req, res) => {
-  console.log("Donor request function called");
-  
-  try {
-    const {
-      foodType,
-      approxPeople,
-      location,
-      expiryTime,
-      imageUrl,
-    } = req.body;
-
-    console.log("Request data:", { foodType, approxPeople, location, expiryTime });
-
-    // Validate required fields
-    if (!foodType || !approxPeople || !location || !expiryTime) {
-      return res.status(400).json({
-        message: "Missing required fields",
-        required: ["foodType", "approxPeople", "location", "expiryTime"]
-      });
-    }
-
-    let lat = "0";
-    let lon = "0";
-
-    // Simple geocoding - handle string location
-    try {
-      const geoRes = await axios.get(
-        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(location)}`
-      );
-      const geoData = geoRes.data;
-      
-      if (geoData && geoData.length > 0) {
-        lat = geoData[0].lat;
-        lon = geoData[0].lon;
-        console.log("Coordinates found:", { lat, lon });
-      }
-    } catch (geoError) {
-      console.log("Geocoding failed, using default coordinates");
-    }
-
-    // Create request without ML service for now
-    const newRequest = new Request({
-      donor: req.user.id,
-      foodType,
-      approxPeople: parseInt(approxPeople),
-      location: {
-        address: location,
-        latitude: lat,
-        longitude: lon,
-      },
-      expiryTime,
-      imageUrl: imageUrl || " ",
-      status: "pending",
-    });
-
-    await newRequest.save();
-    console.log("Request saved successfully");
-
-    res.status(201).json({
-      message: "Request created successfully",
-      request: newRequest,
-    });
-
-  } catch (error) {
-    console.error("Error in donorRequest:", error);
-    res.status(500).json({
-      message: "Server error",
-      error: error.message
-    });
-  }
-};
-
 export const editDonorProfile = async (req, res) => {
   try {
-    const { id } = req.user;
+    const { id } = req.user; // Only need ID
     const donor = await Donor.findById(id);
 
     if (!donor) {
@@ -107,6 +34,148 @@ export const editDonorProfile = async (req, res) => {
   }
 };
 
+export const donorRequest = async (req, res) => {
+  try {
+    const {
+      foodType,
+      approxPeople,
+      location,
+      expiryTime,
+      imageUrl,
+      latitude,
+      longitude,
+    } = req.body;
+    console.log(req.body);
+    let lat = latitude;
+    let lon = longitude;
+    console.log(lat);
+    if (!lat || !lon) {
+      const geoRes = await axios.get(
+        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(location)}`
+      );
+      console.log(geoRes);
+      const geoData = await geoRes.data;
+      if (geoData.length > 0) {
+        lat = geoData[0].lat;
+        lon = geoData[0].lon;
+      } else {
+        throw new Error("Could not geocode address to lat/lon");
+      }
+    }
+
+    console.log("Coordinates:", { lat, lon });
+
+    let mlResponse;
+    try {
+      const mlServiceUrl = "http://192.168.0.110:10000/predict-urgency";
+      const requestData = {
+        food_type: foodType,
+        quantity: approxPeople,
+        expiry_time: expiryTime,
+        location: {
+          lat: parseFloat(lat),
+          lon: parseFloat(lon),
+        },
+      };
+
+      console.log("Sending to ML service:", requestData);
+
+      mlResponse = await axios.post(mlServiceUrl, requestData, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        timeout: 30000,
+      });
+      console.log("ML service response status:", mlResponse.status);
+      console.log("ML service response data:", mlResponse.data);
+    } catch (mlError) {
+      console.error("ML Service Error Details:", {
+        message: mlError.message,
+        status: mlError.response?.status,
+        statusText: mlError.response?.statusText,
+        data: mlError.response?.data,
+        url: mlError.config?.url,
+      });
+
+      if (mlError.response?.data && typeof mlError.response.data === 'string' && 
+          mlError.response.data.includes('<html>')) {
+        console.error("ML service returned HTML instead of JSON - service might be down or misconfigured");
+      }
+      return res.status(500).json({
+        message: "ML service unavailable",
+        error: {
+          service: "ML prediction service",
+          status: mlError.response?.status || 'No response',
+          details: mlError.message,
+        },
+        suggestion: "Please try again later or contact support"
+      });
+    }
+    const { urgency_score, matched_ngos } = mlResponse.data;
+    if (!matched_ngos || !Array.isArray(matched_ngos)) {
+      console.error("Invalid ML response format:", mlResponse.data);
+      return res.status(500).json({
+        message: "Invalid response format from ML service",
+        error: "Expected matched_ngos array"
+      });
+    }
+    const newRequest = new Request({
+      donor: req.user.id,
+      foodType,
+      approxPeople,
+      location: {
+        address: location,
+        latitude: lat,
+        longitude: lon,
+      },
+      expiryTime,
+      imageUrl,
+      status: "pending",
+    });
+
+    await newRequest.save();
+
+    const top3 = matched_ngos.slice(0, 3);
+    const assignedNgos = [];
+
+    for (const ngo of top3) {
+      try {
+        const dbNgo = await Receiver.findOne({ name: ngo.name });
+        if (dbNgo) {
+          if (!dbNgo.requests) dbNgo.requests = [];
+          dbNgo.requests.push(newRequest._id);
+          await dbNgo.save();
+          assignedNgos.push(dbNgo.name);
+          console.log(`Request assigned to: ${dbNgo.name}`);
+        } else {
+          console.warn(`NGO not found in database: ${ngo.name}`);
+        }
+      } catch (ngoError) {
+        console.error(`Error assigning to NGO ${ngo.name}:`, ngoError);
+      }
+    }
+
+    res.status(201).json({
+      message: "Request created successfully",
+      request: newRequest,
+      urgency_score,
+      matched_ngos: top3,
+      assigned_ngos: assignedNgos,
+    });
+
+  } catch (error) {
+    console.error("Error creating request:", error);
+    
+    res.status(500).json({
+      message: "Server error",
+      error: {
+        name: error.name,
+        message: error.message,
+      },
+    });
+  }
+};
 export const getDonorRequests = async (req, res) => {
   const { id } = req.user;
   try {
@@ -120,7 +189,6 @@ export const getDonorRequests = async (req, res) => {
     res.status(500).json({ message: "Server error", error: error.message });
   }
 };
-
 export const getDonorProfile = async (req, res) => {
   try {
     const { id } = req.user;
